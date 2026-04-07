@@ -105,7 +105,7 @@ class EvalForgeEnvironment(Environment[EvalAction, EvalObservation, EvalState]):
             evaluation_instructions=self._task["evaluation_instructions"],
             step=0,
             done=False,
-            reward=0.0,
+            reward=0.001,
             feedback=(
                 "New episode. Evaluate the LLM response above. "
                 "You have 3 attempts. After each attempt you will receive "
@@ -236,7 +236,7 @@ class EvalForgeEnvironment(Environment[EvalAction, EvalObservation, EvalState]):
             )
 
         # ── Improvement bonus ──────────────────────────────────────────
-        raw_score = round(min(score, 1.0), 3)
+        raw_score = round(min(max(score, 0.001), 0.999), 3)
         improvement_bonus = 0.0
         if step_num > 1 and raw_score > self._prev_score:
             improvement_bonus = 0.05
@@ -250,7 +250,7 @@ class EvalForgeEnvironment(Environment[EvalAction, EvalObservation, EvalState]):
                 "Use the feedback above to refine your evaluation."
             )
 
-        final_score = round(min(raw_score + improvement_bonus, 1.0), 3)
+        final_score = round(min(max(raw_score + improvement_bonus, 0.001), 0.999), 3)
 
         # Track scores
         self._prev_score = raw_score
@@ -340,6 +340,6 @@ class EvalForgeEnvironment(Environment[EvalAction, EvalObservation, EvalState]):
             evaluation_instructions=self._task.get("evaluation_instructions", ""),
             step=self._state.step_count,
             done=True,
-            reward=0.0,
+            reward=0.001,
             feedback=msg,
         )
