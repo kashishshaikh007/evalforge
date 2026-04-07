@@ -9,12 +9,12 @@ Requirements met:
 - Emits structured [START], [STEP], [END] stdout logs ✓
 - Produces reproducible baseline scores on all 3 tasks ✓
 - Runs in < 20 min on vcpu=2, memory=8gb ✓
+- No external dependencies beyond openai and requests ✓
 """
 
 import os
-import sys
 import json
-import asyncio
+import requests
 from typing import List, Optional
 
 from openai import OpenAI
@@ -24,6 +24,12 @@ API_BASE_URL = os.getenv("API_BASE_URL", "https://huggingface.co/api/inference-p
 MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
 HF_TOKEN = os.getenv("HF_TOKEN", "")
 IMAGE_NAME = os.getenv("IMAGE_NAME", "evalforge")
+
+# Environment URL — points to the running HF Space
+ENV_BASE_URL = os.getenv(
+    "ENV_BASE_URL",
+    "https://bhartiya-amit-evalforge.hf.space"
+)
 
 BENCHMARK = "evalforge"
 TASK_IDS = ["task_easy", "task_medium", "task_hard"]
@@ -85,6 +91,52 @@ Failure mode definitions:
 Be precise, critical, and thorough in your reasoning. Do not include text outside the JSON."""
 
 
+# ── Environment interaction via HTTP ────────────────────────────────────────
+
+def env_reset(task_id: str) -> dict:
+    """Reset the environment via HTTP POST."""
+    try:
+        resp = requests.post(
+            f"{ENV_BASE_URL}/reset",
+            json={"task_id": task_id},
+            timeout=60,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        # Handle wrapped response format from create_app
+        if "observation" in data:
+            obs = data["observation"]
+            obs["reward"] = data.get("reward", 0.0)
+            obs["done"] = data.get("done", False)
+            return obs
+        return data
+    except Exception as e:
+        print(f"[DEBUG] Reset error: {e}", flush=True)
+        raise
+
+
+def env_step(action_dict: dict) -> dict:
+    """Step the environment via HTTP POST."""
+    try:
+        resp = requests.post(
+            f"{ENV_BASE_URL}/step",
+            json={"action": action_dict},
+            timeout=60,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        # Handle wrapped response format from create_app
+        if "observation" in data:
+            obs = data["observation"]
+            obs["reward"] = data.get("reward", 0.0)
+            obs["done"] = data.get("done", False)
+            return obs
+        return data
+    except Exception as e:
+        print(f"[DEBUG] Step error: {e}", flush=True)
+        raise
+
+
 # ── LLM call ────────────────────────────────────────────────────────────────
 
 def get_model_verdict(obs_data: dict, history: List[str]) -> dict:
@@ -110,44 +162,52 @@ Previous feedback: {obs_data.get('feedback', 'None')}
 
 Provide your evaluation as JSON.""".strip()
 
-    response = llm_client.chat.completions.create(
-        model=MODEL_NAME,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_msg},
-        ],
-        temperature=0.0,
-        max_tokens=800,
-    )
-
-    raw = response.choices[0].message.content.strip()
-
-    # Strip markdown fences if present
-    if raw.startswith("```"):
-        parts = raw.split("```")
-        if len(parts) >= 2:
-            raw = parts[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
-
     try:
+        response = llm_client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_msg},
+            ],
+            temperature=0.0,
+            max_tokens=800,
+        )
+
+        raw = response.choices[0].message.content.strip()
+
+        # Strip markdown fences if present
+        if raw.startswith("```"):
+            parts = raw.split("```")
+            if len(parts) >= 2:
+                raw = parts[1]
+                if raw.startswith("json"):
+                    raw = raw[4:]
+
         return json.loads(raw.strip())
+
     except json.JSONDecodeError:
         return {
             "factual_accuracy": 0.5,
             "instruction_following": 0.5,
             "identified_failure": "none",
-            "reasoning": "Unable to parse model response for evaluation. The response format was not valid JSON and could not be decoded.",
+            "reasoning": "Unable to parse model response for evaluation. The response format was not valid JSON and could not be decoded properly.",
+            "overall_verdict": "flag_for_review",
+        }
+    except Exception as e:
+        print(f"[DEBUG] LLM call error: {e}", flush=True)
+        return {
+            "factual_accuracy": 0.5,
+            "instruction_following": 0.5,
+            "identified_failure": "none",
+            "reasoning": f"Error calling LLM: {str(e)}. Unable to evaluate the response.",
             "overall_verdict": "flag_for_review",
         }
 
 
-# ── Main inference loop using WebSocket client ──────────────────────────────
+# ── Main inference loop ─────────────────────────────────────────────────────
 
-async def run_task(task_id: str) -> float:
-    """Run inference on a single task using the EvalForge WebSocket client."""
-    from evalforge import EvalForgeEnv, EvalAction
-
+def run_task(task_id: str) -> float:
+    """Run inference on a single task using HTTP endpoints."""
     history: List[str] = []
     rewards: List[float] = []
     steps_taken = 0
@@ -157,64 +217,47 @@ async def run_task(task_id: str) -> float:
     log_start(task=task_id, env=BENCHMARK, model=MODEL_NAME)
 
     try:
-        # Support two modes:
-        # 1. Connect to already-running environment via URL (for local testing)
-        # 2. Spin up Docker container automatically (for evaluation)
-        env_url = os.getenv("ENV_BASE_URL", "")
-        if env_url:
-            env = EvalForgeEnv(base_url=env_url)
-        else:
-            env = await EvalForgeEnv.from_docker_image(IMAGE_NAME)
+        obs = env_reset(task_id)
 
-        async with env:
-            result = await env.reset(task_id=task_id)
-            obs_data = result.observation.model_dump() if hasattr(result.observation, 'model_dump') else result.observation.__dict__
+        for step in range(1, MAX_STEPS + 1):
+            if obs.get("done", False):
+                break
 
-            for step in range(1, MAX_STEPS + 1):
-                if result.done:
-                    break
+            verdict = get_model_verdict(obs, history)
 
-                verdict = get_model_verdict(obs_data, history)
+            obs = env_step(verdict)
 
-                action = EvalAction(
-                    factual_accuracy=float(verdict.get("factual_accuracy", 0.5)),
-                    instruction_following=float(verdict.get("instruction_following", 0.5)),
-                    identified_failure=str(verdict.get("identified_failure", "none")),
-                    reasoning=str(verdict.get("reasoning", "No reasoning provided by the model.")),
-                    overall_verdict=str(verdict.get("overall_verdict", "flag_for_review")),
-                )
+            reward = float(obs.get("reward", 0.0))
+            done = obs.get("done", False)
+            steps_taken = step
 
-                result = await env.step(action)
-                obs_data = result.observation.model_dump() if hasattr(result.observation, 'model_dump') else result.observation.__dict__
+            rewards.append(reward)
 
-                reward = result.reward or 0.0
-                done = result.done
-                steps_taken = step
+            action_summary = (
+                f"failure={verdict.get('identified_failure', '?')} "
+                f"verdict={verdict.get('overall_verdict', '?')} "
+                f"factual={verdict.get('factual_accuracy', '?')}"
+            )
 
-                rewards.append(reward)
+            log_step(step=step, action=action_summary, reward=reward, done=done, error=None)
 
-                action_summary = (
-                    f"failure={verdict.get('identified_failure','?')} "
-                    f"verdict={verdict.get('overall_verdict','?')} "
-                    f"factual={verdict.get('factual_accuracy','?')}"
-                )
+            history.append(
+                f"Step {step}: identified={verdict.get('identified_failure')} "
+                f"verdict={verdict.get('overall_verdict')} reward={reward:.3f}"
+            )
 
-                log_step(step=step, action=action_summary, reward=reward, done=done, error=None)
+            if done:
+                break
 
-                history.append(
-                    f"Step {step}: identified={verdict.get('identified_failure')} "
-                    f"verdict={verdict.get('overall_verdict')} reward={reward:.3f}"
-                )
-
-                if done:
-                    break
-
-        score = sum(rewards) / MAX_TOTAL_REWARD if MAX_TOTAL_REWARD > 0 else 0.0
+        score = max(rewards) if rewards else 0.0
         score = min(max(score, 0.0), 1.0)
         success = score >= SUCCESS_SCORE_THRESHOLD
 
     except Exception as e:
-        log_step(step=steps_taken + 1, action="error", reward=0.0, done=True, error=str(e))
+        log_step(
+            step=steps_taken + 1, action="error",
+            reward=0.0, done=True, error=str(e)
+        )
         print(f"[DEBUG] Task {task_id} error: {e}", flush=True)
 
     finally:
@@ -223,14 +266,15 @@ async def run_task(task_id: str) -> float:
     return score
 
 
-async def main():
+def main():
     print(f"[INFO] EvalForge Baseline Inference", flush=True)
     print(f"[INFO] Model: {MODEL_NAME}", flush=True)
+    print(f"[INFO] Env: {ENV_BASE_URL}", flush=True)
     print(f"[INFO] Tasks: {TASK_IDS}", flush=True)
 
     all_scores = {}
     for task_id in TASK_IDS:
-        all_scores[task_id] = await run_task(task_id)
+        all_scores[task_id] = run_task(task_id)
 
     print(f"\n[SUMMARY] Final scores:", flush=True)
     for tid, sc in all_scores.items():
@@ -240,4 +284,4 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
